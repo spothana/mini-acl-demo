@@ -187,6 +187,63 @@
   }
   .tree b { color: var(--accent); font-weight: 500; }
 
+  /* ---- trie walk visualization ---- */
+  .key-strip {
+    position: relative; z-index: 2; display: flex; gap: 4px;
+    margin-bottom: 22px; flex-wrap: wrap;
+  }
+  .kbyte {
+    min-width: 38px; text-align: center; padding: 6px 4px;
+    border: 1px solid var(--line); border-radius: 5px;
+    background: var(--panel-2); font-size: 11px; color: var(--dim);
+    transition: all .25s ease;
+  }
+  .kbyte .ki { display: block; font-size: 8px; letter-spacing: .05em; }
+  .kbyte .kv { font-weight: 700; color: var(--ink); font-size: 13px; }
+  .kbyte.done { border-color: var(--hit); }
+  .kbyte.done .kv { color: var(--hit); }
+  .kbyte.cur { border-color: var(--gold); background: rgba(232,185,77,.16); }
+  .kbyte.cur .kv { color: var(--gold); }
+
+  .trie {
+    position: relative; z-index: 2; display: flex; flex-direction: column;
+    gap: 0; align-items: center; padding: 4px 0;
+  }
+  .tnode {
+    display: flex; align-items: center; gap: 10px;
+    border: 1px solid var(--line); border-radius: 8px;
+    background: var(--panel-2); padding: 9px 14px; font-size: 11.5px;
+    transition: all .3s ease; opacity: .5;
+  }
+  .tnode.lit { opacity: 1; border-color: var(--accent);
+               box-shadow: 0 0 0 3px rgba(77,214,193,.13); }
+  .tnode.leaf.lit { border-color: var(--hit);
+                    box-shadow: 0 0 0 3px rgba(111,207,111,.16); }
+  .tnode .tlabel { color: var(--dim); }
+  .tnode .tlabel b { color: var(--accent); font-weight: 700; }
+  .tnode.leaf .tlabel b { color: var(--hit); }
+  .tbranches { display: flex; gap: 6px; }
+  .tbranch {
+    font-size: 10px; padding: 2px 8px; border-radius: 4px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--dim);
+    transition: all .25s ease;
+  }
+  .tbranch.taken {
+    border-color: var(--gold); background: rgba(232,185,77,.15);
+    color: var(--gold); font-weight: 700;
+  }
+  .tconn {
+    width: 1px; height: 16px; background: var(--wire);
+    transition: background .3s ease;
+  }
+  .tconn.lit { background: var(--accent); }
+  .tleaf-res { display: flex; gap: 5px; }
+  .tleaf-res span {
+    font-size: 10px; padding: 1px 6px; border-radius: 3px;
+    background: var(--panel); border: 1px solid var(--line); color: var(--dim);
+  }
+  .tleaf-res span.hot { border-color: var(--gold); color: var(--gold); font-weight: 700; }
+
   .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 14px 0 4px; font-size: 10.5px; color: var(--dim); }
   .legend span { display: flex; align-items: center; gap: 6px; }
   .dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
@@ -207,9 +264,11 @@
     <h1>How <span class="mono">acl_classify()</span><br>matches a packet</h1>
     <p class="lead">
       A standalone reimplementation of the DPDK Access Control library's
-      core ideas. This page animates the one operation that matters:
-      taking a packet, testing it against every rule, and resolving the
-      highest-priority match for each category — all in a single pass.
+      core ideas. This page animates two things: how
+      <span class="mono">acl_classify()</span> resolves a packet against
+      the rule set, and how <span class="mono">acl_build()</span> compiles
+      that rule set into a multi-bit trie so lookups stop scaling with the
+      rule count.
     </p>
   </header>
 
@@ -287,29 +346,78 @@
 results = { <span style="color:var(--gold)">2</span>, <span style="color:var(--gold)">3</span>, <span style="color:var(--dim)">0</span>, <span style="color:var(--dim)">0</span> };
 <span class="c">//           cat0 cat1 cat2 cat3   — 0 means no match</span></pre>
 
-  <h2><span class="num">04</span>Where DPDK goes faster</h2>
-  <p class="section-sub">The shape we simplified away.</p>
+  <h2><span class="num">04</span>The trie: O(key), not O(rules)</h2>
+  <p class="section-sub">What <code class="inline">acl_build()</code> actually compiles.</p>
   <p>
-    This library does a linear scan — clear, but O(rules) per packet. The
-    real DPDK library compiles the rule set at
-    <code class="inline">build()</code> time into multi-bit tries (stride
-    8) so a lookup walks a few bytes instead of every rule. It also splits
-    rules into non-intersecting subsets to bound memory:
+    The linear scan in section 01 tests every rule for every packet —
+    fine for three rules, ruinous for thousands. So
+    <code class="inline">acl_build()</code> compiles the rule set into a
+    <strong>multi-bit trie</strong>: one level per key byte (stride 8,
+    the same as DPDK). A lookup walks the key one byte at a time, taking
+    the branch whose <code class="inline">[lo,hi]</code> range contains
+    that byte, until it reaches a leaf holding the pre-resolved
+    per-category results. The walk costs the key <em>length</em> — it
+    does not depend on how many rules there are.
   </p>
-  <div class="tree">rule set
-   │
-   ├─ <b>build()</b>  ── compile ──▶  trie A   (subset 1)
-   │                                 trie B   (subset 2)
-   │                                 trie C   (subset 3)
-   │
-   └─ <b>classify()</b>  walks tries 8 bits at a time,
-                      SIMD-parallel across many packets</div>
+
+  <div class="legend">
+    <span><i class="dot" style="background:var(--accent)"></i> node on the lookup path</span>
+    <span><i class="dot" style="background:var(--gold)"></i> branch taken</span>
+    <span><i class="dot" style="background:var(--hit)"></i> resolved leaf</span>
+  </div>
+
+  <div class="stage">
+    <div class="stage-head">
+      <div class="stage-title">trie walk · key byte by byte</div>
+      <div class="controls">
+        <button id="trieKeyBtn">key: 1 / 3</button>
+        <button id="trieRunBtn" class="primary">▶ walk</button>
+        <button id="trieResetBtn">reset</button>
+      </div>
+    </div>
+
+    <div class="key-strip" id="keyStrip"></div>
+    <div class="trie" id="trieView"></div>
+    <div class="status" id="trieStatus">idle — press <b>walk</b> to trace a lookup.</div>
+  </div>
+
   <p>
-    The observable behaviour is identical — same matches, same priority
-    resolution, same per-category results — which is exactly why this
-    project can reproduce the documentation's
-    <code class="inline">{2,3,0,0}</code> output without any of the trie
-    machinery.
+    Each leaf already knows the answer because
+    <code class="inline">build()</code> did the priority resolution once,
+    at compile time, for every reachable key. That is the trade: build is
+    slower and uses memory, but every later <code class="inline">classify()</code>
+    is a flat byte-walk. DPDK pushes this further — splitting rules into
+    non-intersecting subsets to bound memory, and walking several packets
+    in parallel with SIMD — but the core shape is exactly this trie.
+  </p>
+
+  <h2><span class="num">05</span>The space/time trade-off</h2>
+  <p class="section-sub">Why build() is the expensive call.</p>
+  <p>
+    A trie is not free. Every distinct byte-range boundary in the rule set
+    can fork a node, so the structure can grow much larger than the rule
+    list it came from. DPDK exposes a
+    <code class="inline">max_size</code> knob for exactly this reason: cap
+    the runtime memory, accept more or fewer sub-tries. mini_acl reports
+    the same numbers from <code class="inline">acl_build()</code>:
+  </p>
+  <pre><span class="c">/* printed by the demo after build() */</span>
+build(): compiled 3 rules into a multi-bit trie
+  key length    : 13 bytes   <span class="c">// one trie level per byte</span>
+  trie nodes    : 476         <span class="c">// 413 inner + 63 leaves</span>
+  max depth     : 13          <span class="c">// lookup cost, fixed</span>
+  RT memory     : ~16232 bytes
+  default method: TRIE
+
+<span class="c">// 3 rules -> 476 nodes. The trie trades space for a</span>
+<span class="c">// lookup whose cost no longer scales with rule count.</span></pre>
+  <p>
+    Both backends stay available, and <code class="inline">demo.c</code>
+    runs <em>both</em> for every packet and asserts they agree — the trie
+    is a faster data structure for the same algorithm, never a different
+    answer. The test suite proves it the hard way, sweeping 40 keys and
+    checking <code class="inline">SCALAR</code> and
+    <code class="inline">TRIE</code> match on every one.
   </p>
 
   <footer>
@@ -509,6 +617,171 @@ $("pktBtn").addEventListener("click", () => {
 });
 
 resetView();
+
+/* =====================================================================
+ *  Section 04 -- trie walk animation
+ *
+ *  The real trie has one level per key byte (13 levels). For clarity the
+ *  animation shows the DISCRIMINATING bytes only -- the bytes where a
+ *  branch actually decides something -- and treats the rest as a single
+ *  "wildcard bytes" hop. Each step picks the [lo,hi] branch the key byte
+ *  falls into; the final leaf carries the resolved per-category results.
+ * ===================================================================== */
+
+/* Per key: the sequence of trie steps. Each step lists branches with an
+ * inclusive [lo,hi] label; `pick` is the index of the branch the key
+ * takes. The leaf holds the four category results. */
+const TRIE_KEYS = [
+  { name:"src 10.1.1.1 → dst 192.168.1.15",
+    bytes:[["proto",6],["dst[0]",192],["dst[1]",168],["dst[2]",1],["src[0]",10]],
+    steps:[
+      { node:"proto", branches:["any"], pick:0,
+        note:"proto wildcard in every rule — one branch" },
+      { node:"dst ip byte 0", branches:["= 192","other"], pick:0,
+        note:"192 → stays on the 192.168/16 + /24 paths" },
+      { node:"dst ip byte 1", branches:["= 168","other"], pick:0,
+        note:"168 → still on both 192.168.* rules" },
+      { node:"dst ip byte 2", branches:["= 1","other"], pick:0,
+        note:"1 → now also inside 192.168.1.0/24 (rule 2)" },
+      { node:"src ip byte 0", branches:["= 10","other"], pick:0,
+        note:"10 → also matches src 10.1.1.1 (rule 3)" },
+    ],
+    leaf:[2,3,0,0] },
+
+  { name:"src 192.168.1.1 → dst 192.168.2.11",
+    bytes:[["proto",6],["dst[0]",192],["dst[1]",168],["dst[2]",2],["src[0]",192]],
+    steps:[
+      { node:"proto", branches:["any"], pick:0,
+        note:"proto wildcard — one branch" },
+      { node:"dst ip byte 0", branches:["= 192","other"], pick:0,
+        note:"192 → on the 192.168/16 path" },
+      { node:"dst ip byte 1", branches:["= 168","other"], pick:0,
+        note:"168 → inside 192.168.0.0/16 (rule 1)" },
+      { node:"dst ip byte 2", branches:["= 1","other"], pick:1,
+        note:"2 ≠ 1 → falls OUT of 192.168.1.0/24 (rule 2 drops)" },
+      { node:"src ip byte 0", branches:["= 10","other"], pick:1,
+        note:"192 ≠ 10 → rule 3 never applied; only rule 1 left" },
+    ],
+    leaf:[1,1,0,0] },
+
+  { name:"src 10.1.1.1 → dst 201.212.111.12",
+    bytes:[["proto",6],["dst[0]",201],["dst[1]",212],["dst[2]",111],["src[0]",10]],
+    steps:[
+      { node:"proto", branches:["any"], pick:0,
+        note:"proto wildcard — one branch" },
+      { node:"dst ip byte 0", branches:["= 192","other"], pick:1,
+        note:"201 ≠ 192 → both dst rules drop immediately" },
+      { node:"dst ip byte 1", branches:["any"], pick:0,
+        note:"dst no longer constrains anything" },
+      { node:"dst ip byte 2", branches:["any"], pick:0,
+        note:"still nothing on the dst side" },
+      { node:"src ip byte 0", branches:["= 10","other"], pick:0,
+        note:"10 → matches src 10.1.1.1 (rule 3), category 1 only" },
+    ],
+    leaf:[0,3,0,0] },
+];
+
+let trieKey = 0;
+let trieRunning = false;
+
+function renderKeyStrip() {
+  const k = TRIE_KEYS[trieKey];
+  $("keyStrip").innerHTML = k.bytes.map((b,i) =>
+    `<div class="kbyte" id="kb${i}">
+       <span class="ki">${b[0]}</span><span class="kv">${b[1]}</span>
+     </div>`).join("");
+  $("trieKeyBtn").textContent = `key: ${trieKey+1} / ${TRIE_KEYS.length}`;
+}
+
+function renderTrie(activeStep, leafShown) {
+  const k = TRIE_KEYS[trieKey];
+  let html = "";
+  k.steps.forEach((s, i) => {
+    const lit = activeStep != null && i <= activeStep;
+    const branches = s.branches.map((b, bi) => {
+      const taken = lit && i <= activeStep && bi === s.pick
+                    && (i < activeStep || activeStep >= 0);
+      const showTaken = lit && bi === s.pick && i <= activeStep;
+      return `<span class="tbranch ${showTaken ? "taken" : ""}">${b}</span>`;
+    }).join("");
+    html += `<div class="tnode ${lit ? "lit" : ""}" id="tn${i}">
+       <span class="tlabel">level ${i}: <b>${s.node}</b></span>
+       <span class="tbranches">${branches}</span>
+     </div>`;
+    html += `<div class="tconn ${lit ? "lit" : ""}" id="tc${i}"></div>`;
+  });
+  // leaf
+  const leafLit = leafShown;
+  const res = k.leaf.map((v,c) =>
+    `<span class="${v ? "hot" : ""}">c${c}:${v}</span>`).join("");
+  html += `<div class="tnode leaf ${leafLit ? "lit" : ""}" id="tnleaf">
+     <span class="tlabel"><b>leaf</b> — resolved results</span>
+     <span class="tleaf-res">${res}</span>
+   </div>`;
+  $("trieView").innerHTML = html;
+}
+
+function trieReset() {
+  trieRunning = false;
+  renderKeyStrip();
+  renderTrie(null, false);
+  $("trieStatus").innerHTML = "idle — press <b>walk</b> to trace a lookup.";
+  $("trieRunBtn").disabled = false;
+  $("trieKeyBtn").disabled = false;
+}
+
+async function trieRun() {
+  if (trieRunning) return;
+  trieRunning = true;
+  $("trieRunBtn").disabled = true;
+  $("trieKeyBtn").disabled = true;
+
+  const k = TRIE_KEYS[trieKey];
+  renderTrie(null, false);
+  $("trieStatus").innerHTML =
+    "starting at the root — the lookup will consume one key byte per level.";
+  await sleep(700);
+
+  for (let i = 0; i < k.steps.length; i++) {
+    const s = k.steps[i];
+    // light the key byte being consumed
+    for (let j = 0; j < k.bytes.length; j++) {
+      const el = $("kb"+j);
+      el.classList.remove("cur");
+      if (j < i)  el.classList.add("done");
+      if (j === i) el.classList.add("cur");
+    }
+    renderTrie(i, false);
+    $("trieStatus").innerHTML =
+      `level ${i} — key byte <b>${k.bytes[i][0]} = ${k.bytes[i][1]}</b>: ` +
+      s.note;
+    await sleep(1150);
+  }
+  // mark the last byte done, reveal the leaf
+  for (let j = 0; j < k.bytes.length; j++) {
+    $("kb"+j).classList.remove("cur");
+    $("kb"+j).classList.add("done");
+  }
+  renderTrie(k.steps.length - 1, true);
+  $("trieStatus").innerHTML =
+    `reached the leaf in <b>${k.steps.length} steps</b> — results ` +
+    `<b>{${k.leaf.join(", ")}}</b>. The walk length is the key length, ` +
+    `not the rule count.`;
+
+  trieRunning = false;
+  $("trieRunBtn").disabled = false;
+  $("trieKeyBtn").disabled = false;
+}
+
+$("trieRunBtn").addEventListener("click", trieRun);
+$("trieResetBtn").addEventListener("click", trieReset);
+$("trieKeyBtn").addEventListener("click", () => {
+  if (trieRunning) return;
+  trieKey = (trieKey + 1) % TRIE_KEYS.length;
+  trieReset();
+});
+
+trieReset();
 </script>
 </body>
 </html>
