@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mini_acl — How Packet Classification Works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #0d1117;
+    --panel:     #161b22;
+    --panel-2:   #1c2330;
+    --line:      #2a3340;
+    --ink:       #e6edf3;
+    --dim:       #7d8a99;
+    --wire:      #3a4654;
+    --accent:    #4dd6c1;   /* teal — the moving packet */
+    --hit:       #6fcf6f;   /* green — a match */
+    --miss:      #d65f5f;   /* red — a reject */
+    --gold:      #e8b94d;   /* priority / userdata */
+    --cat:       #6ea8ff;   /* category accent */
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--bg); }
+  body {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--ink);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    background-image:
+      radial-gradient(circle at 12% -5%, rgba(77,214,193,.07), transparent 45%),
+      radial-gradient(circle at 95% 8%, rgba(110,168,255,.07), transparent 40%);
+    background-attachment: fixed;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 64px 28px 96px; }
+
+  /* ---- header ---- */
+  header { border-bottom: 1px solid var(--line); padding-bottom: 32px; margin-bottom: 44px; }
+  .eyebrow {
+    font-size: 12px; letter-spacing: .26em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 18px;
+  }
+  h1 {
+    font-family: 'Fraunces', serif; font-weight: 600;
+    font-size: clamp(2.2rem, 5.5vw, 3.5rem);
+    line-height: 1.08; letter-spacing: -.02em;
+  }
+  h1 .mono { font-family: 'JetBrains Mono', monospace; color: var(--accent); font-weight: 700; }
+  .lead { color: var(--dim); margin-top: 18px; max-width: 60ch; font-size: .96rem; }
+
+  h2 {
+    font-family: 'Fraunces', serif; font-weight: 600;
+    font-size: 1.6rem; margin: 56px 0 8px; letter-spacing: -.01em;
+  }
+  h2 .num {
+    font-family: 'JetBrains Mono', monospace; font-size: .9rem;
+    color: var(--accent); margin-right: 12px; font-weight: 700;
+  }
+  .section-sub { color: var(--dim); font-size: .9rem; margin-bottom: 24px; }
+  p { color: #c7d1dc; font-size: .92rem; margin: 14px 0; }
+  code.inline {
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 6px; font-size: .85em; color: var(--accent);
+  }
+
+  /* ---- the animation stage ---- */
+  .stage {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 28px; margin: 24px 0;
+    position: relative; overflow: hidden;
+  }
+  .stage::before {
+    content: ""; position: absolute; inset: 0;
+    background-image: linear-gradient(var(--line) 1px, transparent 1px),
+                      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 26px 26px; opacity: .14; pointer-events: none;
+  }
+  .stage-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 22px; position: relative; z-index: 2;
+  }
+  .stage-title { font-size: 12px; letter-spacing: .2em; text-transform: uppercase; color: var(--dim); }
+  .controls { display: flex; gap: 10px; }
+  button {
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500;
+    background: var(--panel-2); color: var(--ink);
+    border: 1px solid var(--wire); border-radius: 6px;
+    padding: 7px 14px; cursor: pointer; transition: all .15s ease;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); color: #07100e; border-color: var(--accent); font-weight: 700; }
+  button.primary:hover { filter: brightness(1.12); color: #07100e; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+
+  /* ---- the packet ---- */
+  .packet-rail { position: relative; height: 64px; margin-bottom: 8px; z-index: 2; }
+  .packet {
+    position: absolute; top: 8px; left: 0;
+    display: flex; border-radius: 7px; overflow: hidden;
+    border: 1px solid var(--accent);
+    box-shadow: 0 0 0 4px rgba(77,214,193,.12), 0 8px 22px rgba(0,0,0,.5);
+    transition: left .6s cubic-bezier(.5,0,.2,1);
+  }
+  .pkt-cell {
+    padding: 7px 11px; font-size: 11px; background: var(--panel-2);
+    border-right: 1px solid var(--line); white-space: nowrap;
+    transition: background .25s ease, color .25s ease;
+  }
+  .pkt-cell:last-child { border-right: none; }
+  .pkt-cell .k { color: var(--dim); display: block; font-size: 8.5px; letter-spacing: .08em; }
+  .pkt-cell .v { color: var(--accent); font-weight: 700; }
+  .pkt-cell.testing { background: rgba(232,185,77,.16); }
+  .pkt-cell.testing .v { color: var(--gold); }
+
+  /* ---- rules table ---- */
+  .rules { position: relative; z-index: 2; display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+  .rule {
+    border: 1px solid var(--line); border-radius: 8px;
+    background: var(--panel-2); padding: 14px 16px;
+    transition: border-color .3s ease, box-shadow .3s ease, opacity .3s ease;
+  }
+  .rule.active { border-color: var(--gold); box-shadow: 0 0 0 3px rgba(232,185,77,.12); }
+  .rule.matched { border-color: var(--hit); box-shadow: 0 0 0 3px rgba(111,207,111,.14); }
+  .rule.rejected { opacity: .42; }
+  .rule-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 9px; }
+  .rule-name { font-weight: 700; font-size: 13px; }
+  .rule-meta { font-size: 10.5px; color: var(--dim); display: flex; gap: 12px; }
+  .rule-meta .pri { color: var(--gold); }
+  .rule-meta .cat { color: var(--cat); }
+  .rule-meta .ud  { color: var(--hit); }
+  .fields { display: flex; flex-wrap: wrap; gap: 7px; }
+  .field {
+    font-size: 10.5px; padding: 3px 9px; border-radius: 4px;
+    background: var(--panel); border: 1px solid var(--line); color: var(--dim);
+    transition: all .25s ease;
+  }
+  .field.test { background: rgba(232,185,77,.14); border-color: var(--gold); color: var(--gold); }
+  .field.pass { background: rgba(111,207,111,.13); border-color: var(--hit); color: var(--hit); }
+  .field.fail { background: rgba(214,95,95,.13); border-color: var(--miss); color: var(--miss); }
+  .verdict {
+    font-size: 11px; font-weight: 700; margin-top: 10px; min-height: 16px;
+    opacity: 0; transition: opacity .3s ease;
+  }
+  .verdict.show { opacity: 1; }
+  .verdict.ok   { color: var(--hit); }
+  .verdict.no   { color: var(--miss); }
+
+  /* ---- results ---- */
+  .results {
+    position: relative; z-index: 2; margin-top: 22px;
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+  }
+  .res-cell {
+    border: 1px solid var(--line); border-radius: 8px;
+    background: var(--panel-2); padding: 12px; text-align: center;
+  }
+  .res-cell .lbl { font-size: 9.5px; letter-spacing: .14em; color: var(--dim); text-transform: uppercase; }
+  .res-cell .val {
+    font-family: 'Fraunces', serif; font-size: 2rem; font-weight: 600;
+    margin-top: 4px; transition: color .35s ease, transform .35s ease;
+    color: var(--wire);
+  }
+  .res-cell.filled .val { color: var(--gold); transform: scale(1.06); }
+  .res-cell.zero .val   { color: var(--dim); }
+
+  .status {
+    position: relative; z-index: 2; margin-top: 18px;
+    font-size: 11.5px; color: var(--dim); min-height: 18px;
+    border-left: 2px solid var(--accent); padding-left: 12px;
+  }
+  .status b { color: var(--accent); }
+
+  /* ---- code blocks ---- */
+  pre {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 20px 22px; overflow-x: auto;
+    margin: 18px 0; font-size: 12.5px; line-height: 1.7;
+  }
+  pre .c { color: var(--dim); }       /* comment  */
+  pre .t { color: var(--cat); }       /* type     */
+  pre .s { color: var(--hit); }       /* string   */
+  pre .f { color: var(--gold); }      /* function */
+  .tree {
+    font-size: 12px; color: var(--dim); white-space: pre; line-height: 1.7;
+  }
+  .tree b { color: var(--accent); font-weight: 500; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 14px 0 4px; font-size: 10.5px; color: var(--dim); }
+  .legend span { display: flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+
+  footer {
+    margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--line);
+    font-size: 11px; color: var(--dim);
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">mini_acl · documentation</div>
+    <h1>How <span class="mono">acl_classify()</span><br>matches a packet</h1>
+    <p class="lead">
+      A standalone reimplementation of the DPDK Access Control library's
+      core ideas. This page animates the one operation that matters:
+      taking a packet, testing it against every rule, and resolving the
+      highest-priority match for each category — all in a single pass.
+    </p>
+  </header>
+
+  <h2><span class="num">01</span>The classification loop</h2>
+  <p class="section-sub">Press <em>Run</em> to send a packet through the rule set.</p>
+
+  <p>
+    A packet is an <strong>N-tuple</strong> — here a 5-tuple of protocol,
+    source/destination IP, and source/destination port. Each rule declares
+    a value (or range, or bitmask) for every field. The packet matches a
+    rule only when <em>all</em> of its fields pass. Among the rules that
+    match, the one with the highest <code class="inline">priority</code>
+    wins each category it serves.
+  </p>
+
+  <div class="legend">
+    <span><i class="dot" style="background:var(--gold)"></i> testing</span>
+    <span><i class="dot" style="background:var(--hit)"></i> field passed / rule matched</span>
+    <span><i class="dot" style="background:var(--miss)"></i> field failed / rule rejected</span>
+    <span><i class="dot" style="background:var(--accent)"></i> the packet</span>
+  </div>
+
+  <div class="stage">
+    <div class="stage-head">
+      <div class="stage-title">classification stage</div>
+      <div class="controls">
+        <button id="pktBtn">packet: 1 / 3</button>
+        <button id="runBtn" class="primary">▶ run</button>
+        <button id="resetBtn">reset</button>
+      </div>
+    </div>
+
+    <div class="packet-rail">
+      <div class="packet" id="packet"></div>
+    </div>
+
+    <div class="rules" id="rules"></div>
+
+    <div class="results" id="results"></div>
+
+    <div class="status" id="status">idle — press <b>run</b> to classify the current packet.</div>
+  </div>
+
+  <h2><span class="num">02</span>The three field types</h2>
+  <p class="section-sub">Each rule field is tested by one of three comparisons.</p>
+  <p>
+    Every field definition picks a <code class="inline">type</code>, and
+    that type decides what its two numbers — <code class="inline">value</code>
+    and <code class="inline">range</code> — actually mean:
+  </p>
+  <pre><span class="c">/* MASK — value + prefix length. Built for IP addresses. */</span>
+<span class="t">192.168.0.0</span>/<span class="f">16</span>   matches  192.168.*.*       <span class="c">// compare top 16 bits</span>
+
+<span class="c">/* RANGE — an inclusive [low, high] interval. Built for ports. */</span>
+<span class="t">[1024, 65535]</span>     matches  any port &gt;= 1024
+
+<span class="c">/* BITMASK — value + a mask selecting which bits to check. */</span>
+<span class="t">value=6 mask=0xff</span>  matches  protocol 6 (TCP) exactly</pre>
+
+  <h2><span class="num">03</span>Parallel category lookup</h2>
+  <p class="section-sub">One search, many answers.</p>
+  <p>
+    Each rule carries a <code class="inline">category_mask</code>. A single
+    <code class="inline">acl_classify()</code> call returns one result per
+    category — so a firewall rule set, a routing rule set, and a QoS rule
+    set can live in one context and all be resolved together. In the
+    animation above, watch the four result cells fill independently:
+    different rules can win different categories for the very same packet.
+  </p>
+  <pre><span class="c">/* the call — keys in, one result per category out */</span>
+<span class="t">uint32_t</span> results[4];
+<span class="f">acl_classify</span>(ctx, keys, <span class="t">1</span>, results);
+
+<span class="c">/* packet from 10.1.1.1 to 192.168.1.15 yields: */</span>
+results = { <span style="color:var(--gold)">2</span>, <span style="color:var(--gold)">3</span>, <span style="color:var(--dim)">0</span>, <span style="color:var(--dim)">0</span> };
+<span class="c">//           cat0 cat1 cat2 cat3   — 0 means no match</span></pre>
+
+  <h2><span class="num">04</span>Where DPDK goes faster</h2>
+  <p class="section-sub">The shape we simplified away.</p>
+  <p>
+    This library does a linear scan — clear, but O(rules) per packet. The
+    real DPDK library compiles the rule set at
+    <code class="inline">build()</code> time into multi-bit tries (stride
+    8) so a lookup walks a few bytes instead of every rule. It also splits
+    rules into non-intersecting subsets to bound memory:
+  </p>
+  <div class="tree">rule set
+   │
+   ├─ <b>build()</b>  ── compile ──▶  trie A   (subset 1)
+   │                                 trie B   (subset 2)
+   │                                 trie C   (subset 3)
+   │
+   └─ <b>classify()</b>  walks tries 8 bits at a time,
+                      SIMD-parallel across many packets</div>
+  <p>
+    The observable behaviour is identical — same matches, same priority
+    resolution, same per-category results — which is exactly why this
+    project can reproduce the documentation's
+    <code class="inline">{2,3,0,0}</code> output without any of the trie
+    machinery.
+  </p>
+
+  <footer>
+    mini_acl — a teaching reimplementation of DPDK ACL concepts.<br>
+    Original reference:
+    <a href="https://doc.dpdk.org/guides/prog_guide/packet_classif_access_ctrl.html">
+    DPDK Programmer's Guide · Packet Classification and Access Control</a>.
+  </footer>
+
+</div>
+
+<script>
+/* ---- model: the demo rules & packets, mirroring demo.c ---- */
+const PACKETS = [
+  { name:"src 10.1.1.1 → 192.168.1.15",
+    cells:[["proto","TCP"],["src ip","10.1.1.1"],["dst ip","192.168.1.15"],["sport","1024"],["dport","80"]],
+    expect:[2,3,0,0] },
+  { name:"src 192.168.1.1 → 192.168.2.11",
+    cells:[["proto","TCP"],["src ip","192.168.1.1"],["dst ip","192.168.2.11"],["sport","1024"],["dport","80"]],
+    expect:[1,1,0,0] },
+  { name:"src 10.1.1.1 → 201.212.111.12",
+    cells:[["proto","TCP"],["src ip","10.1.1.1"],["dst ip","201.212.111.12"],["sport","1024"],["dport","80"]],
+    expect:[0,3,0,0] },
+];
+
+/* each rule: per-packet field outcomes, precomputed for clarity.
+   fields shown to the user; pass[] is per packet index. */
+const RULES = [
+  { name:"rule 1", pri:1, cats:[0,1], ud:1,
+    fields:["dst ∈ 192.168.0.0/16","any proto","any ports"],
+    pass:[true, true, false] },
+  { name:"rule 2", pri:2, cats:[0], ud:2,
+    fields:["dst ∈ 192.168.1.0/24","any proto","any ports"],
+    pass:[true, false, false] },
+  { name:"rule 3", pri:3, cats:[1], ud:3,
+    fields:["src = 10.1.1.1","any proto","any ports"],
+    pass:[true, false, true] },
+];
+
+let pktIndex = 0;
+let running = false;
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ---- render ---- */
+function renderPacket() {
+  const p = PACKETS[pktIndex];
+  $("packet").innerHTML = p.cells.map(c =>
+    `<div class="pkt-cell"><span class="k">${c[0]}</span><span class="v">${c[1]}</span></div>`
+  ).join("");
+  $("packet").style.left = "0px";
+  $("pktBtn").textContent = `packet: ${pktIndex+1} / ${PACKETS.length}`;
+}
+
+function renderRules() {
+  $("rules").innerHTML = RULES.map((r,i) => `
+    <div class="rule" id="rule${i}">
+      <div class="rule-top">
+        <span class="rule-name">${r.name}</span>
+        <span class="rule-meta">
+          <span class="pri">priority ${r.pri}</span>
+          <span class="cat">cat {${r.cats.join(",")}}</span>
+          <span class="ud">userdata ${r.ud}</span>
+        </span>
+      </div>
+      <div class="fields">
+        ${r.fields.map((f,fi)=>`<span class="field" id="r${i}f${fi}">${f}</span>`).join("")}
+      </div>
+      <div class="verdict" id="verdict${i}"></div>
+    </div>`).join("");
+}
+
+function renderResults(vals) {
+  $("results").innerHTML = [0,1,2,3].map(c => {
+    const v = vals ? vals[c] : null;
+    const cls = v == null ? "" : (v === 0 ? "zero" : "filled");
+    const show = v == null ? "·" : v;
+    return `<div class="res-cell ${cls}" id="res${c}">
+      <div class="lbl">category ${c}</div>
+      <div class="val">${show}</div>
+    </div>`;
+  }).join("");
+}
+
+function resetView() {
+  running = false;
+  renderPacket();
+  renderRules();
+  renderResults(null);
+  $("status").innerHTML = "idle — press <b>run</b> to classify the current packet.";
+  $("runBtn").disabled = false;
+  $("pktBtn").disabled = false;
+}
+
+/* ---- the animated classification ---- */
+async function run() {
+  if (running) return;
+  running = true;
+  $("runBtn").disabled = true;
+  $("pktBtn").disabled = true;
+  renderRules();
+  renderResults(null);
+
+  const pkt = PACKETS[pktIndex];
+  const best = [null,null,null,null];   // {pri, ud} per category
+  const results = [0,0,0,0];
+
+  for (let i = 0; i < RULES.length; i++) {
+    const r = RULES[i];
+    const ruleEl = $("rule"+i);
+    ruleEl.classList.add("active");
+
+    // slide the packet alongside the rule under test
+    $("packet").style.left = (10 + i*4) + "px";
+    $("status").innerHTML = `testing <b>${r.name}</b> against packet — checking each field…`;
+    await sleep(650);
+
+    // test fields one by one
+    let allPass = true;
+    for (let fi = 0; fi < r.fields.length; fi++) {
+      const fEl = $(`r${i}f${fi}`);
+      fEl.classList.add("test");
+      // highlight the matching packet cell for the first (key) field
+      if (fi === 0) {
+        const cellEl = $("packet").children[i===2?1:2]; // src for rule3, else dst
+        cellEl && cellEl.classList.add("testing");
+      }
+      await sleep(420);
+      fEl.classList.remove("test");
+      // field 0 is the discriminating one; others are wildcards (always pass)
+      const fieldPass = fi === 0 ? r.pass[pktIndex] : true;
+      fEl.classList.add(fieldPass ? "pass" : "fail");
+      if (fi === 0) {
+        [...$("packet").children].forEach(c=>c.classList.remove("testing"));
+      }
+      if (!fieldPass) { allPass = false; break; }
+      await sleep(200);
+    }
+
+    ruleEl.classList.remove("active");
+    const verdict = $("verdict"+i);
+    verdict.classList.add("show");
+
+    if (allPass) {
+      ruleEl.classList.add("matched");
+      verdict.classList.add("ok");
+      verdict.textContent = `✓ matched — priority ${r.pri}, contends categories {${r.cats.join(",")}}`;
+      // resolve into categories by priority
+      let took = [];
+      for (const c of r.cats) {
+        if (best[c] === null || r.pri > best[c].pri) {
+          best[c] = { pri:r.pri, ud:r.ud };
+          results[c] = r.ud;
+          took.push(c);
+        }
+      }
+      renderResults(results);
+      for (const c of took) {
+        const cell = $("res"+c);
+        cell.style.transition = "none";
+        cell.style.boxShadow = "0 0 0 3px rgba(232,185,77,.35)";
+        setTimeout(()=>{ cell.style.transition="box-shadow .5s"; cell.style.boxShadow="none"; }, 60);
+      }
+      $("status").innerHTML = took.length
+        ? `<b>${r.name}</b> matched and now leads categories {${took.join(",")}} with priority ${r.pri}.`
+        : `<b>${r.name}</b> matched, but lost every category to a higher-priority rule.`;
+    } else {
+      ruleEl.classList.add("rejected");
+      verdict.classList.add("no");
+      verdict.textContent = "✗ rejected — a field did not pass";
+      $("status").innerHTML = `<b>${r.name}</b> rejected — moving on.`;
+    }
+    await sleep(900);
+  }
+
+  // final
+  renderResults(results);
+  $("packet").style.left = "0px";
+  const ok = JSON.stringify(results) === JSON.stringify(pkt.expect);
+  $("status").innerHTML =
+    `done — results <b>{${results.join(", ")}}</b> ` +
+    (ok ? "✓ matches the DPDK documentation." : "(unexpected).");
+
+  running = false;
+  $("runBtn").disabled = false;
+  $("pktBtn").disabled = false;
+}
+
+/* ---- wire up ---- */
+$("runBtn").addEventListener("click", run);
+$("resetBtn").addEventListener("click", resetView);
+$("pktBtn").addEventListener("click", () => {
+  if (running) return;
+  pktIndex = (pktIndex + 1) % PACKETS.length;
+  resetView();
+});
+
+resetView();
+</script>
+</body>
+</html>
